@@ -1,6 +1,8 @@
 // ignore_for_file: public_member_api_docs, sort_constructors_first
 import 'dart:async';
+import 'dart:convert';
 import 'dart:developer';
+import 'dart:io';
 // import 'package:Bloomee/model/source_engines.dart';
 import 'package:Bloomee/model/yt_music_model.dart';
 import 'package:Bloomee/repository/MixedAPI/mixed_api.dart';
@@ -14,6 +16,8 @@ import 'package:Bloomee/model/songModel.dart';
 import 'package:Bloomee/model/youtube_vid_model.dart';
 import 'package:Bloomee/repository/Youtube/youtube_api.dart';
 import 'package:Bloomee/services/db/bloomee_db_service.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:path/path.dart' as p;
 
 class ImporterState {
   int totalItems = 0;
@@ -47,6 +51,115 @@ class ImporterState {
       isFailed: isFailed ?? this.isFailed,
       message: message ?? this.message,
     );
+  }
+}
+
+class ImportLogger {
+  static File? _logFile;
+  static IOSink? _logSink;
+
+  static Future<void> initializeLog(String playlistName) async {
+    try {
+      final appDocDir = await getApplicationDocumentsDirectory();
+      final logDir = Directory(p.join(appDocDir.path, 'import_logs'));
+      if (!await logDir.exists()) {
+        await logDir.create(recursive: true);
+      }
+      
+      final timestamp = DateTime.now().toIso8601String().replaceAll(':', '-').split('.')[0];
+      final sanitizedName = playlistName.replaceAll(RegExp(r'[<>:"/\\|?*]'), '_');
+      _logFile = File(p.join(logDir.path, 'spotify_import_${sanitizedName}_$timestamp.log'));
+      _logSink = _logFile!.openWrite(mode: FileMode.write);
+      
+      // Write header
+      _logSink!.writeln('=' * 100);
+      _logSink!.writeln('Spotify Playlist Import Log');
+      _logSink!.writeln('Playlist: $playlistName');
+      _logSink!.writeln('Started: ${DateTime.now()}');
+      _logSink!.writeln('=' * 100);
+      _logSink!.writeln('');
+      await _logSink!.flush();
+      
+      log('Import log created: ${_logFile!.path}', name: 'ImportLogger');
+    } catch (e) {
+      log('Failed to create log file: $e', name: 'ImportLogger');
+    }
+  }
+
+  static Future<void> logImportAttempt({
+    required int index,
+    required String spotifyTitle,
+    required String spotifyArtists,
+    required String spotifyUrl,
+    String? spotifyAlbum,
+    String? ytmTitle,
+    String? ytmArtist,
+    String? ytmAlbum,
+    String? ytmUrl,
+    String? ytmSource,
+    int? matchScore,
+    bool success = false,
+    String? errorMessage,
+  }) async {
+    if (_logSink == null) return;
+    
+    try {
+      _logSink!.writeln('[$index] ----------------------------------------');
+      _logSink!.writeln('SPOTIFY ORIGINAL:');
+      _logSink!.writeln('  Title:   $spotifyTitle');
+      _logSink!.writeln('  Artists: $spotifyArtists');
+      if (spotifyAlbum != null) _logSink!.writeln('  Album:   $spotifyAlbum');
+      _logSink!.writeln('  URL:     $spotifyUrl');
+      _logSink!.writeln('');
+      
+      if (success && ytmTitle != null) {
+        _logSink!.writeln('YOUTUBE MUSIC MATCH:');
+        _logSink!.writeln('  Title:   $ytmTitle');
+        _logSink!.writeln('  Artist:  $ytmArtist');
+        if (ytmAlbum != null) _logSink!.writeln('  Album:   $ytmAlbum');
+        _logSink!.writeln('  URL:     $ytmUrl');
+        _logSink!.writeln('  Source:  $ytmSource');
+        if (matchScore != null) _logSink!.writeln('  Match:   $matchScore%');
+        _logSink!.writeln('  Status:  ✓ SUCCESS');
+      } else {
+        _logSink!.writeln('RESULT:');
+        _logSink!.writeln('  Status:  ✗ FAILED');
+        if (errorMessage != null) _logSink!.writeln('  Error:   $errorMessage');
+      }
+      _logSink!.writeln('');
+      await _logSink!.flush();
+    } catch (e) {
+      log('Failed to write to log: $e', name: 'ImportLogger');
+    }
+  }
+
+  static Future<void> finalizeLog({
+    required int totalTracks,
+    required int successCount,
+    required int failedCount,
+  }) async {
+    if (_logSink == null) return;
+    
+    try {
+      _logSink!.writeln('=' * 100);
+      _logSink!.writeln('Import Complete');
+      _logSink!.writeln('Finished: ${DateTime.now()}');
+      _logSink!.writeln('Total Tracks: $totalTracks');
+      _logSink!.writeln('Successful:   $successCount');
+      _logSink!.writeln('Failed:       $failedCount');
+      _logSink!.writeln('Success Rate: ${(successCount / totalTracks * 100).toStringAsFixed(2)}%');
+      _logSink!.writeln('=' * 100);
+      await _logSink!.flush();
+      await _logSink!.close();
+      
+      log('Import log finalized: ${_logFile!.path}', name: 'ImportLogger');
+      SnackbarService.showMessage('Import log saved to: ${_logFile!.path}', duration: const Duration(seconds: 5));
+    } catch (e) {
+      log('Failed to finalize log: $e', name: 'ImportLogger');
+    } finally {
+      _logSink = null;
+      _logFile = null;
+    }
   }
 }
 
@@ -252,7 +365,7 @@ class ExternalMediaImporter {
     if (playlistID != null) {
       log("Playlist ID: $playlistID", name: "Playlist Importer");
       final accessToken = await SpotifyApi().getAccessTokenCC();
-      String title;
+      String title = '';
       try {
         yield ImporterState(
           totalItems: 0,
@@ -268,9 +381,14 @@ class ExternalMediaImporter {
         // log(data.toString());
         final tracks = data["tracks"] as List;
         int totalItems = tracks.length;
-        String artists;
+        String artists = '';
         int i = 1;
+        int failedCount = 0;
+        
         if (tracks.isNotEmpty) {
+          // Initialize log file
+          await ImportLogger.initializeLog(playlistTitle);
+          
           BloomeeDBService.createPlaylist(
             playlistTitle,
             source: 'spotify',
@@ -279,6 +397,7 @@ class ExternalMediaImporter {
             permaURL: data["url"].toString(),
             artURL: data["imgUrl"].toString(),
           );
+          
           for (var (e as Map) in tracks) {
             try {
               title = (e['track']['name']).toString();
@@ -286,7 +405,11 @@ class ExternalMediaImporter {
                   .map((e) => e['name'])
                   .toList()
                   .join(", ");
+              final spotifyUrl = e['track']['external_urls']?['spotify']?.toString() ?? 'N/A';
+              final spotifyAlbum = e['track']['album']?['name']?.toString();
+              
               log("$title by $artists", name: "Playlist Importer");
+              
               if (title.isNotEmpty) {
                 MediaItemModel? mediaItem;
                 // final country = await getCountry();
@@ -301,30 +424,77 @@ class ExternalMediaImporter {
                     "$title $artists".trim(),
                     useStringMatcher: false);
                 // }
+                
                 if (mediaItem != null) {
                   BloomeeDBService.addMediaItem(
                       MediaItem2MediaItemDB(mediaItem), playlistTitle);
+                  
+                  // Log successful match
+                  await ImportLogger.logImportAttempt(
+                    index: i,
+                    spotifyTitle: title,
+                    spotifyArtists: artists,
+                    spotifyUrl: spotifyUrl,
+                    spotifyAlbum: spotifyAlbum,
+                    ytmTitle: mediaItem.title,
+                    ytmArtist: mediaItem.artist,
+                    ytmAlbum: mediaItem.album,
+                    ytmUrl: mediaItem.extras?['url']?.toString() ?? 'N/A',
+                    ytmSource: 'ytmusic',
+                    success: true,
+                  );
+                  
                   yield ImporterState(
                     totalItems: totalItems,
                     importedItems: i,
-                    failedItems: 0,
+                    failedItems: failedCount,
                     isDone: false,
                     isFailed: false,
                     message: "Importing($i/$totalItems): ${mediaItem.title}",
                   );
                   i++;
                   log("Added: ${mediaItem.title}", name: "Playlist Importer");
+                } else {
+                  // Log failed match
+                  failedCount++;
+                  await ImportLogger.logImportAttempt(
+                    index: i,
+                    spotifyTitle: title,
+                    spotifyArtists: artists,
+                    spotifyUrl: spotifyUrl,
+                    spotifyAlbum: spotifyAlbum,
+                    success: false,
+                    errorMessage: 'No matching YouTube Music track found',
+                  );
+                  log("Failed to find match for: $title by $artists", name: "Playlist Importer");
                 }
               }
             } catch (e) {
+              failedCount++;
+              await ImportLogger.logImportAttempt(
+                index: i,
+                spotifyTitle: title,
+                spotifyArtists: artists,
+                spotifyUrl: 'Error',
+                success: false,
+                errorMessage: e.toString(),
+              );
               log(e.toString());
               continue;
             }
           }
+          
+          // Finalize log
+          await ImportLogger.finalizeLog(
+            totalTracks: totalItems,
+            successCount: i - 1,
+            failedCount: failedCount,
+          );
+          
           yield ImporterState(
             totalItems: totalItems,
             importedItems: i - 1,
-            failedItems: 0,
+            failedItems: failedCount,
             isDone: true,
             isFailed: false,
             message: "Imported Playlist: $playlistTitle",
@@ -416,7 +586,7 @@ class ExternalMediaImporter {
     if (albumID != null) {
       log("Album ID: $albumID", name: "Album Importer");
       final accessToken = await SpotifyApi().getAccessTokenCC();
-      String title;
+      String title = '';
       try {
         yield ImporterState(
           totalItems: 0,
@@ -441,48 +611,106 @@ class ExternalMediaImporter {
 
         final tracks = data["tracks"] as List;
         int totalItems = tracks.length;
-        String artists;
+        String artists = '';
         int i = 1;
+        int failedCount = 0;
+        
         if (tracks.isNotEmpty && albumTitle.isNotEmpty) {
+          // Initialize log file
+          await ImportLogger.initializeLog(albumTitle);
+          
           for (var (e as Map) in tracks) {
-            title = (e['name']).toString();
-            artists = (e['artists'] as List)
-                .map((e) => e['name'])
-                .toList()
-                .join(", ");
-            log("$title by $artists", name: "Album Importer");
-            if (title.isNotEmpty) {
-              MediaItemModel? mediaItem;
-              // final country = await getCountry();
-              // if (sourceEngineCountries[SourceEngine.eng_JIS]!
-              //     .contains(country)) {
-              //   log("Getting from MixedAPI", name: "Playlist Importer");
-              //   mediaItem =
-              //       await MixedAPI().getTrackMixed("$title $artists".trim());
-              // } else {
-              log("Getting from YTM", name: "Playlist Importer");
-              mediaItem =
-                  await MixedAPI().getYtTrackByMeta("$title $artists".trim());
-              // }
-              if (mediaItem != null) {
-                BloomeeDBService.addMediaItem(
-                    MediaItem2MediaItemDB(mediaItem), albumTitle);
-                yield ImporterState(
-                  totalItems: totalItems,
-                  importedItems: i,
-                  failedItems: 0,
-                  isDone: false,
-                  isFailed: false,
-                  message: "Importing($i/$totalItems): ${mediaItem.title}",
-                );
-                i++;
+            try {
+              title = (e['name']).toString();
+              artists = (e['artists'] as List)
+                  .map((e) => e['name'])
+                  .toList()
+                  .join(", ");
+              final spotifyUrl = e['external_urls']?['spotify']?.toString() ?? 'N/A';
+              
+              log("$title by $artists", name: "Album Importer");
+              
+              if (title.isNotEmpty) {
+                MediaItemModel? mediaItem;
+                // final country = await getCountry();
+                // if (sourceEngineCountries[SourceEngine.eng_JIS]!
+                //     .contains(country)) {
+                //   log("Getting from MixedAPI", name: "Playlist Importer");
+                //   mediaItem =
+                //       await MixedAPI().getTrackMixed("$title $artists".trim());
+                // } else {
+                log("Getting from YTM", name: "Playlist Importer");
+                mediaItem =
+                    await MixedAPI().getYtTrackByMeta("$title $artists".trim());
+                // }
+                
+                if (mediaItem != null) {
+                  BloomeeDBService.addMediaItem(
+                      MediaItem2MediaItemDB(mediaItem), albumTitle);
+                  
+                  // Log successful match
+                  await ImportLogger.logImportAttempt(
+                    index: i,
+                    spotifyTitle: title,
+                    spotifyArtists: artists,
+                    spotifyUrl: spotifyUrl,
+                    spotifyAlbum: albumTitle,
+                    ytmTitle: mediaItem.title,
+                    ytmArtist: mediaItem.artist,
+                    ytmAlbum: mediaItem.album,
+                    ytmUrl: mediaItem.extras?['url']?.toString() ?? 'N/A',
+                    ytmSource: 'ytmusic',
+                    success: true,
+                  );
+                  
+                  yield ImporterState(
+                    totalItems: totalItems,
+                    importedItems: i,
+                    failedItems: failedCount,
+                    isDone: false,
+                    isFailed: false,
+                    message: "Importing($i/$totalItems): ${mediaItem.title}",
+                  );
+                  i++;
+                } else {
+                  // Log failed match
+                  failedCount++;
+                  await ImportLogger.logImportAttempt(
+                    index: i,
+                    spotifyTitle: title,
+                    spotifyArtists: artists,
+                    spotifyUrl: spotifyUrl,
+                    spotifyAlbum: albumTitle,
+                    success: false,
+                    errorMessage: 'No matching YouTube Music track found',
+                  );
+                }
               }
+            } catch (e) {
+              failedCount++;
+              await ImportLogger.logImportAttempt(
+                index: i,
+                spotifyTitle: title,
+                spotifyArtists: artists,
+                spotifyUrl: 'Error',
+                success: false,
+                errorMessage: e.toString(),
+              );
+              log(e.toString());
             }
           }
+          
+          // Finalize log
+          await ImportLogger.finalizeLog(
+            totalTracks: totalItems,
+            successCount: i - 1,
+            failedCount: failedCount,
+          );
+          
           yield ImporterState(
             totalItems: totalItems,
             importedItems: i - 1,
-            failedItems: 0,
+            failedItems: failedCount,
             isDone: true,
             isFailed: false,
             message: "Imported Album: $albumTitle",
